@@ -91,9 +91,8 @@ struct InstructionReport {
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let input = if cli.file {
-        fs::read_to_string(&cli.input).map_err(|error| {
-            ParseError::Input(format!("cannot read '{}': {error}", cli.input))
-        })?
+        fs::read_to_string(&cli.input)
+            .map_err(|error| ParseError::Input(format!("cannot read '{}': {error}", cli.input)))?
     } else {
         cli.input
     };
@@ -147,7 +146,10 @@ fn build_report(transaction: &VersionedTransaction) -> Result<TransactionReport,
             index,
             address: address.to_string(),
             signer: message.is_signer(index),
-            writable: message.is_maybe_writable(index),
+            writable: message.is_maybe_writable_with_reserved_addresses(
+                index,
+                None::<&std::collections::HashSet<solana_address::Address>>,
+            ),
         })
         .collect::<Vec<_>>();
 
@@ -156,26 +158,19 @@ fn build_report(transaction: &VersionedTransaction) -> Result<TransactionReport,
         .iter()
         .enumerate()
         .map(|(index, instruction)| {
-            let program = static_keys
-                .get(instruction.program_id_index as usize)
-                .ok_or_else(|| ParseError::Decode(format!("instruction {index} has an invalid program index")))?;
+            let program = account_label(static_keys, instruction.program_id_index);
             let accounts = instruction
                 .accounts
                 .iter()
-                .map(|account_index| {
-                    static_keys
-                        .get(*account_index as usize)
-                        .map(ToString::to_string)
-                        .ok_or_else(|| ParseError::Decode(format!("instruction {index} has an invalid account index")))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|account_index| account_label(static_keys, *account_index))
+                .collect::<Vec<_>>();
             Ok(InstructionReport {
                 index,
-                program: program.to_string(),
+                program: program.clone(),
                 accounts,
                 data_base58: bs58::encode(&instruction.data).into_string(),
                 data_len: instruction.data.len(),
-                summary: summarize_instruction(&program.to_string(), &instruction.data),
+                summary: summarize_instruction(&program, &instruction.data),
             })
         })
         .collect::<Result<Vec<_>, ParseError>>()?;
@@ -186,7 +181,11 @@ fn build_report(transaction: &VersionedTransaction) -> Result<TransactionReport,
             VersionedMessage::V0(_) => "v0",
             VersionedMessage::V1(_) => "v1",
         },
-        signatures: transaction.signatures.iter().map(ToString::to_string).collect(),
+        signatures: transaction
+            .signatures
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         fee_payer: static_keys.first().map(ToString::to_string),
         recent_blockhash: message.recent_blockhash().to_string(),
         required_signatures: message.header().num_required_signatures,
@@ -196,6 +195,13 @@ fn build_report(transaction: &VersionedTransaction) -> Result<TransactionReport,
         instructions,
         address_table_lookups: message.address_table_lookups().map_or(0, <[_]>::len),
     })
+}
+
+fn account_label(account_keys: &[solana_address::Address], index: u8) -> String {
+    account_keys
+        .get(index as usize)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("lookup-account-index-{index}"))
 }
 
 fn summarize_instruction(program: &str, data: &[u8]) -> String {
@@ -242,7 +248,10 @@ fn print_report(report: &TransactionReport) {
     for signature in &report.signatures {
         println!("    {signature}");
     }
-    println!("  fee payer: {}", report.fee_payer.as_deref().unwrap_or("unknown"));
+    println!(
+        "  fee payer: {}",
+        report.fee_payer.as_deref().unwrap_or("unknown")
+    );
     println!("  recent blockhash: {}", report.recent_blockhash);
     println!("  accounts: {}", report.account_keys.len());
     for account in &report.account_keys {
@@ -251,7 +260,11 @@ fn print_report(report: &TransactionReport) {
             account.index,
             account.address,
             if account.signer { " signer" } else { "" },
-            if account.writable { " writable" } else { " readonly" }
+            if account.writable {
+                " writable"
+            } else {
+                " readonly"
+            }
         );
     }
     println!("  instructions: {}", report.instructions.len());
@@ -272,14 +285,15 @@ fn print_report(report: &TransactionReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_keypair::Signer;
     use solana_message::legacy::Message;
-    use solana_transaction::Transaction;
 
     #[test]
     fn reports_system_transfer() {
         let payer = solana_keypair::Keypair::new();
-        let recipient = solana_address::Address::new_unique();
-        let instruction = solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 42);
+        let recipient = solana_address::Address::new_from_array([7; 32]);
+        let instruction =
+            solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 42);
         let message = Message::new(&[instruction], Some(&payer.pubkey()));
         let transaction = VersionedTransaction {
             signatures: vec![solana_signature::Signature::default()],
@@ -287,7 +301,33 @@ mod tests {
         };
         let report = build_report(&transaction).unwrap();
         assert_eq!(report.format, "legacy");
-        assert_eq!(report.instructions[0].summary, "system: transfer 42 lamports");
+        assert_eq!(
+            report.instructions[0].summary,
+            "system: transfer 42 lamports"
+        );
         assert_eq!(report.account_keys.len(), 3);
+    }
+
+    #[test]
+    fn decodes_base58_wire_transaction() {
+        let payer = solana_keypair::Keypair::new();
+        let recipient = solana_address::Address::new_from_array([7; 32]);
+        let instruction =
+            solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 42);
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let transaction = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message: VersionedMessage::Legacy(message),
+        };
+        let encoded = bs58::encode(bincode::serialize(&transaction).unwrap()).into_string();
+        let decoded = decode_input(&encoded, Encoding::Base58).unwrap();
+        let decoded_transaction: VersionedTransaction = bincode::deserialize(&decoded).unwrap();
+        assert_eq!(
+            build_report(&decoded_transaction)
+                .unwrap()
+                .instructions
+                .len(),
+            1
+        );
     }
 }
